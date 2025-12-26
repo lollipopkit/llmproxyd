@@ -9,9 +9,11 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -298,7 +300,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Create HTTP server
 	s.server = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		Addr:    net.JoinHostPort(strings.TrimSpace(cfg.Host), strconv.Itoa(cfg.Port)),
 		Handler: engine,
 	}
 
@@ -740,26 +742,129 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
 
+	host := ""
+	if s.cfg != nil {
+		host = strings.TrimSpace(s.cfg.Host)
+	}
+	addrs, err := buildListenAddrs(host, s.cfg.Port)
+	if err != nil {
+		return err
+	}
+	listeners, err := openListeners(addrs, host == "")
+	if err != nil {
+		return err
+	}
+
+	listenerAddrs := make([]string, 0, len(listeners))
+	for _, ln := range listeners {
+		if ln != nil {
+			listenerAddrs = append(listenerAddrs, ln.Addr().String())
+		}
+	}
+
 	useTLS := s.cfg != nil && s.cfg.TLS.Enable
 	if useTLS {
 		cert := strings.TrimSpace(s.cfg.TLS.Cert)
 		key := strings.TrimSpace(s.cfg.TLS.Key)
 		if cert == "" || key == "" {
+			closeListeners(listeners)
 			return fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
 		}
-		log.Debugf("Starting API server on %s with TLS", s.server.Addr)
-		if errServeTLS := s.server.ListenAndServeTLS(cert, key); errServeTLS != nil && !errors.Is(errServeTLS, http.ErrServerClosed) {
-			return fmt.Errorf("failed to start HTTPS server: %v", errServeTLS)
+		log.Debugf("Starting API server on %s with TLS", strings.Join(listenerAddrs, ", "))
+		return serveOnListeners(func(ln net.Listener) error {
+			return s.server.ServeTLS(ln, cert, key)
+		}, listeners)
+	}
+
+	log.Debugf("Starting API server on %s", strings.Join(listenerAddrs, ", "))
+	return serveOnListeners(s.server.Serve, listeners)
+}
+
+func buildListenAddrs(host string, port int) ([]string, error) {
+	if port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("invalid listen port: %d", port)
+	}
+	portStr := strconv.Itoa(port)
+	trimmedHost := strings.TrimSpace(host)
+	if trimmedHost == "" {
+		return []string{
+			net.JoinHostPort("0.0.0.0", portStr),
+			net.JoinHostPort("::", portStr),
+		}, nil
+	}
+	return []string{net.JoinHostPort(trimmedHost, portStr)}, nil
+}
+
+func openListeners(addrs []string, allowPartial bool) ([]net.Listener, error) {
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no listen addresses provided")
+	}
+	listeners := make([]net.Listener, 0, len(addrs))
+	var errs []error
+	for _, addr := range addrs {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", addr, err))
+			continue
 		}
-		return nil
+		listeners = append(listeners, ln)
+	}
+	if len(listeners) == 0 {
+		if len(errs) == 1 {
+			return nil, errs[0]
+		}
+		return nil, fmt.Errorf("failed to listen on %s", strings.Join(formatListenErrors(errs), "; "))
+	}
+	if len(errs) > 0 && !allowPartial {
+		closeListeners(listeners)
+		if len(errs) == 1 {
+			return nil, errs[0]
+		}
+		return nil, fmt.Errorf("failed to listen on %s", strings.Join(formatListenErrors(errs), "; "))
+	}
+	for _, err := range errs {
+		log.Warnf("listen warning: %v", err)
+	}
+	return listeners, nil
+}
+
+func serveOnListeners(serve func(net.Listener) error, listeners []net.Listener) error {
+	errCh := make(chan error, len(listeners))
+	for _, ln := range listeners {
+		listener := ln
+		go func() {
+			errCh <- serve(listener)
+		}()
 	}
 
-	log.Debugf("Starting API server on %s", s.server.Addr)
-	if errServe := s.server.ListenAndServe(); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
-		return fmt.Errorf("failed to start HTTP server: %v", errServe)
+	var firstErr error
+	for i := 0; i < len(listeners); i++ {
+		err := <-errCh
+		if err != nil && !errors.Is(err, http.ErrServerClosed) && firstErr == nil {
+			firstErr = err
+		}
 	}
+	return firstErr
+}
 
-	return nil
+func closeListeners(listeners []net.Listener) {
+	for _, ln := range listeners {
+		if ln == nil {
+			continue
+		}
+		_ = ln.Close()
+	}
+}
+
+func formatListenErrors(errs []error) []string {
+	out := make([]string, 0, len(errs))
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		out = append(out, err.Error())
+	}
+	return out
 }
 
 // Stop gracefully shuts down the API server without interrupting any
